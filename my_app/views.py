@@ -4,12 +4,44 @@ from datetime import datetime
 from my_app.schems import user_schema, category_schema, record_schema, income_accounting_schema
 from my_app.model import User, IncomeAccounting, Category, Record
 from marshmallow.exceptions import ValidationError
+from flask_jwt_extended import JWTManager, jwt_required, create_access_token, jwt_required, verify_jwt_in_request, get_jwt_identity
+from passlib.hash import pbkdf2_sha256
 
 
+jwt = JWTManager(app)
 
 with app.app_context():
     db.create_all()
     db.session.commit()
+
+@jwt.expired_token_loader
+def expired_token_callback(jwt_header, jwt_payload):
+   return (
+       jsonify({"message": "The token has expired.", "error": "token_expired"}),
+       401,
+   )
+
+@jwt.invalid_token_loader
+def invalid_token_callback(error):
+   return (
+       jsonify(
+           {"message": "Signature verification failed.", "error": "invalid_token"}
+       ),
+       401,
+   )
+
+@jwt.unauthorized_loader
+def missing_token_callback(error):
+   return (
+       jsonify(
+           {
+               "description": "Request does not contain an access token.",
+               "error": "authorization_required",
+           }
+       ),
+       401,
+   )
+
 
 
 @app.route("/")
@@ -28,7 +60,13 @@ def healthcheck():
 @app.route("/user/<int:user_id>", methods=['GET', 'DELETE'])
 def control_users(user_id):
     with app.app_context():
+        jwt_claims = verify_jwt_in_request()
+        if jwt_claims is None:
+            return jsonify({'ERROR': 'invalid token'}), 400
+        current_user_id = get_jwt_identity()
         user = User.query.get(user_id)
+        if current_user_id != user_id:
+            return jsonify({'ERROR': 'Permission is invalid'}), 403
 
         if not user:
             return jsonify({'ERROR': f'USER ID - {user_id} IS NOT EXIST'}), 404
@@ -55,7 +93,7 @@ def control_users(user_id):
 
 
 
-@app.route('/user', methods=['POST'])
+@app.route('/user/reg', methods=['POST'])
 def create_user():
     data = request.get_json()
 
@@ -67,6 +105,7 @@ def create_user():
 
     new_user = User(
         username=user_data["username"],
+        password=pbkdf2_sha256.hash(user_data["password"]),
         income_accounting =IncomeAccounting(**user_data.get("income_accounting", {}))
     )
 
@@ -81,8 +120,34 @@ def create_user():
 
         return jsonify(user_response), 200
 
+@app.route('/user/login', methods=['POST'])
+def login_user():
+    data = request.get_json()
+
+    user_sch = user_schema()
+    try:
+        user_data = user_sch.load(data)
+    except ValidationError as err:
+        return jsonify({'ERROR': err.messages}), 400
+
+    username = user_data["username"]
+    provided_user_id = user_data["id"]
+
+    with app.app_context():
+        user = User.query.filter_by(id=provided_user_id, username=username).first()
+        if user:
+            is_valid_credent = pbkdf2_sha256.verify(user_data["password"], user.password)
+            if provided_user_id is not None and is_valid_credent:
+                access_token_id = create_access_token(identity=user.id)
+                return jsonify({"NESSAGE": "Successful login", "token": access_token_id, "user_id": user.id}), 200
+            else:
+                return jsonify({"MESSAGE": "Unsuccessful login (invalid credentials)"}), 401
+        else:
+            return jsonify({"MESSAGE": "Unsuccessful login (user not found)"}), 404
+
 
 @app.route('/users', methods=['GET'])
+@jwt_required()
 def get_users():
     with app.app_context():
         users_data = {
@@ -93,6 +158,7 @@ def get_users():
 
 
 @app.route('/category', methods=['POST', 'GET'])
+@jwt_required()
 def manage_category():
     if request.method == 'GET':
         with app.app_context():
@@ -122,20 +188,22 @@ def manage_category():
             return jsonify(category_response), 200
 
 
-@app.route('/category/<int:cat_id>', methods=['DELETE'])
-def delete_category(cat_id):
+@app.route('/category/<int:category_id>', methods=['DELETE'])
+@jwt_required()
+def delete_category(category_id):
     with app.app_context():
-        category = Category.query.get(cat_id)
+        category = Category.query.get(category_id)
 
         if not category:
-            return jsonify({'ERROR': f'CATEGORY ID - {cat_id} NOT EXIST'}), 404
+            return jsonify({'ERROR': f'CATEGORY ID - {category_id} NOT EXIST'}), 404
 
         db.session.delete(category)
         db.session.commit()
-        return jsonify({'MESSAGE': f'CATEGORY ID - {cat_id} DELETED'}), 200
+        return jsonify({'MESSAGE': f'CATEGORY ID - {category_id} DELETED'}), 200
 
 
 @app.route('/records', methods=['GET'])
+@jwt_required()
 def get_all_records():
     with app.app_context():
         records_data = {
@@ -153,6 +221,7 @@ def get_all_records():
 
 
 @app.route('/record/<int:record_id>', methods=['GET', 'DELETE'])
+@jwt_required()
 def manage_record(record_id):
     with app.app_context():
         record = Record.query.get(record_id)
@@ -176,71 +245,64 @@ def manage_record(record_id):
             return jsonify({'MESSAGE': f'RECORD ID - {record_id} DELETED'}), 200
 
 
-@app.route('/record', methods=['POST', 'GET'])
-def manage_records():
-    if request.method == 'GET':
-        user_id = request.args.get('user_id')
-        category_id = request.args.get('category_id')
+@app.route('/record', methods=['GET'])
+@jwt_required()
+def get_records():
+    user_id = request.args.get('user_id')
+    category_id = request.args.get('category_id')
+    if not user_id and not category_id:
+       return jsonify({'ERROR': 'SPECIFY USER ID AND CATEGORY ID'}), 400
+    query = Record.query
+    if user_id:
+        query = query.filter_by(user_id=user_id)
+    if category_id:
+        query = query.filter_by(category_id=category_id)
+    need_records = query.all()
+    print(need_records)
+    records_data = {
+       record.id: {
+           "user_id": record.user_id,
+           "cat_id": record.category_id,
+           "amount": record.amount,
+           "created_at": record.created_at
+       } for record in need_records
+    }
+    return jsonify(records_data)
 
-        if not user_id and not category_id:
-           return jsonify({'ERROR': 'SPECIFY USER ID AND CATEGORY ID'}), 400
+@app.route('/record', methods=['POST'])
+@jwt_required()
+def post_record():
+    data = request.get_json()
+    record_sch = record_schema()
 
+    try:
+        record_data = record_sch.load(data)
+    except ValidationError as err:
+        return jsonify({'ERROR': err.messages}), 400
 
-        query = Record.query
-        if user_id:
-            query = query.filter_by(user_id=user_id)
-        if category_id:
-            query = query.filter_by(category_id=category_id)
+    user_id = record_data['user_id']
+    user = User.query.get(user_id)
+    if not user:
+        return jsonify({'ERROR': 'USER NOT EXIST'}), 404
 
-        need_records = query.all()
-        print(need_records)
-        records_data = {
-           record.id: {
-               "user_id": record.user_id,
-               "cat_id": record.category_id,
-               "amount": record.amount,
-               "created_at": record.created_at
-           } for record in need_records
-        }
-        return jsonify(records_data)
+    if user.income_accounting.balance < record_data['amount']:
+        return jsonify({'ERROR': 'NOTHING'}), 400
+    user.income_accounting.balance -= record_data['amount']
+    db.session.commit()
+    new_record = Record(
+        user_id=user_id,
+        category_id=record_data['category_id'],
+        amount=record_data['amount']
+    )
 
-    elif request.method == 'POST':
-        data = request.get_json()
-
-        record_sch = record_schema()
-        try:
-            record_data = record_sch.load(data)
-        except ValidationError as err:
-            return jsonify({'ERROR': err.messages}), 400
-
-        user_id = record_data['user_id']
-        user = User.query.get(user_id)
-
-        if not user:
-            return jsonify({'ERROR': 'USER NOT EXIST'}), 404
-
-        if user.income_accounting.balance < record_data['amount']:
-            return jsonify({'ERROR': 'NOTHING'}), 400
-
-        user.income_accounting.balance -= record_data['amount']
+    with app.app_context():
+        db.session.add(new_record)
         db.session.commit()
-
-        new_record = Record(
-            user_id=user_id,
-            category_id=record_data['category_id'],
-            amount=record_data['amount']
-        )
-
-        with app.app_context():
-            db.session.add(new_record)
-            db.session.commit()
-
-            record_response = {
-                "id": new_record.id,
-                "user_id": new_record.user_id,
-                "cat_id": new_record.category_id,
-                "amount": new_record.amount
-            }
-
-            return jsonify(record_response), 200
+        record_response = {
+            "id": new_record.id,
+            "user_id": new_record.user_id,
+            "cat_id": new_record.category_id,
+            "amount": new_record.amount
+        }
+        return jsonify(record_response), 200
 

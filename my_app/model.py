@@ -6,6 +6,7 @@ class User(db.Model):
 
     id = db.Column(db.Integer(), primary_key=True)
     username = db.Column(db.String(length=30), nullable=False, unique=False)
+    password = db.Column(db.String(length=255), nullable=False)
     records = db.relationship("Record", back_populates="user", lazy="dynamic")
     income_accounting = db.relationship("IncomeAccounting", back_populates="user", uselist=False, primaryjoin="User.id == IncomeAccounting.user_id")
 

@@ -11,5 +11,7 @@ class income_accounting_schema(Schema):
 
 
 class user_schema(Schema):
+    id = fields.Int()
     username = fields.String(required=True)
+    password = fields.String(required=True)
     income_accounting = fields.Nested(income_accounting_schema)
